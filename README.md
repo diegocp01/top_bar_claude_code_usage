@@ -4,6 +4,12 @@ Small macOS menu-bar utility that shows live Claude Code usage limits and reset
 timing next to the clock. It is a port of the Codex usage menu bar, rebuilt for
 Claude Code.
 
+<p align="left">
+  <img src="docs/widget-percentage.png" alt="Percentage display" height="34">
+  &nbsp;&nbsp;
+  <img src="docs/widget-battery.png" alt="Battery display with countdown" height="34">
+</p>
+
 The app reads your Claude Code login from the macOS keychain item
 `Claude Code-credentials` (the same one the Claude Code CLI uses), refreshes the
 OAuth access token when needed, and calls Anthropic's `/api/oauth/usage`
