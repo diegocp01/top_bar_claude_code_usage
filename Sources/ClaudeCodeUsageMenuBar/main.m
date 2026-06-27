@@ -18,6 +18,13 @@ static NSString * const WidgetWindowWeekly = @"weekly";
 static NSString * const RefreshIntervalKey = @"refreshIntervalSeconds";
 static NSTimeInterval const DefaultRefreshIntervalSeconds = 300.0;
 
+// Persisted last-good usage snapshot, so the widget keeps showing real numbers
+// even while the API is unreachable or rate-limiting us.
+static NSString * const LastGoodStateKey = @"lastGoodState";
+static NSString * const LastGoodFetchedAtKey = @"lastGoodFetchedAt";
+// Upper bound on how long we back off the network after repeated failures.
+static NSTimeInterval const UsageBackoffMaxSeconds = 600.0;
+
 // Claude Code OAuth configuration (matches the Claude Code CLI production config).
 static NSString * const KeychainService = @"Claude Code-credentials";
 static NSString * const OAuthClientID = @"9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -33,6 +40,12 @@ static NSString * const OAuthBetaHeader = @"oauth-2025-04-20";
 @property(nonatomic, strong) NSImage *claudeIcon;
 @property(nonatomic, copy) NSString *launchAtLoginError;
 @property(nonatomic, strong) NSDate *refreshBackoffUntil;
+// Last successful usage snapshot + when we got it, and the network cool-down
+// the API has effectively imposed on us (e.g. after a 429).
+@property(nonatomic, strong) NSDictionary *lastGoodState;
+@property(nonatomic, strong) NSDate *lastGoodFetchedAt;
+@property(nonatomic, strong) NSDate *usageBackoffUntil;
+@property(nonatomic, assign) NSTimeInterval usageBackoffSeconds;
 @end
 
 @implementation AppDelegate
@@ -48,6 +61,8 @@ static NSString * const OAuthBetaHeader = @"oauth-2025-04-20";
         WidgetWindowModeKey: WidgetWindowSession,
         RefreshIntervalKey: @(DefaultRefreshIntervalSeconds)
     }];
+
+    [self restoreLastGoodState];
 
     self.claudeIcon = [self claudeMenuBarIcon];
     self.statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
@@ -560,44 +575,138 @@ static NSString * const OAuthBetaHeader = @"oauth-2025-04-20";
 #pragma mark - Data source: Claude Code OAuth usage API
 
 - (NSDictionary *)loadUsageState {
+    // If the API has effectively throttled us, don't poke it again — keep showing
+    // the last good numbers until the cool-down passes. The display still ticks.
+    if (self.usageBackoffUntil != nil && [self.usageBackoffUntil timeIntervalSinceNow] > 0 &&
+        self.lastGoodState != nil) {
+        return [self staleStateFromGood:self.lastGoodState];
+    }
+
     NSString *credsError = nil;
     NSDictionary *creds = [self readKeychainCredentials:&credsError];
     if (creds == nil) {
-        return [self errorStateWithMessage:credsError ?: @"Claude Code credentials not found"];
+        return [self stateForFailure:credsError ?: @"Claude Code credentials not found"];
     }
 
     NSString *tokenError = nil;
     NSString *accessToken = [self validAccessTokenFromCredentials:creds error:&tokenError];
     if (accessToken.length == 0) {
-        return [self errorStateWithMessage:tokenError ?: @"No valid access token"];
+        return [self stateForFailure:tokenError ?: @"No valid access token"];
     }
 
     NSInteger status = 0;
     NSString *httpError = nil;
-    NSData *data = [self getURL:UsageURL bearer:accessToken statusCode:&status error:&httpError];
+    NSTimeInterval retryAfter = 0;
+    NSData *data = [self getURL:UsageURL bearer:accessToken statusCode:&status retryAfter:&retryAfter error:&httpError];
 
     // A 401 can mean the cached token went stale mid-flight; try one forced refresh.
     if (status == 401) {
         NSString *refreshError = nil;
         NSString *refreshed = [self refreshAccessTokenWithCredentials:creds error:&refreshError];
         if (refreshed.length > 0) {
-            data = [self getURL:UsageURL bearer:refreshed statusCode:&status error:&httpError];
+            data = [self getURL:UsageURL bearer:refreshed statusCode:&status retryAfter:&retryAfter error:&httpError];
             accessToken = refreshed;
         }
     }
 
+    // Rate limited (or any transient failure): enter a cool-down and serve cache.
+    if (status == 429) {
+        [self enterUsageBackoffWithRetryAfter:retryAfter];
+        return [self stateForFailure:@"Rate limited by Claude usage API"];
+    }
     if (data == nil || status != 200) {
+        [self enterUsageBackoffWithRetryAfter:0];
         NSString *detail = httpError.length > 0 ? httpError : [NSString stringWithFormat:@"HTTP %ld", (long)status];
-        return [self errorStateWithMessage:[NSString stringWithFormat:@"Usage request failed: %@", detail]];
+        return [self stateForFailure:[NSString stringWithFormat:@"Usage request failed: %@", detail]];
     }
 
     id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
     if (![json isKindOfClass:[NSDictionary class]]) {
-        return [self errorStateWithMessage:@"Usage response was not valid JSON"];
+        return [self stateForFailure:@"Usage response was not valid JSON"];
     }
 
     NSString *plan = [self stringFromDictionary:creds keys:@[@"subscriptionType"]];
-    return [self buildStateFromUsageResponse:json plan:plan timestamp:[NSDate date]];
+    NSDictionary *fresh = [self buildStateFromUsageResponse:json plan:plan timestamp:[NSDate date]];
+
+    NSNumber *ok = fresh[@"ok"];
+    if ([ok respondsToSelector:@selector(boolValue)] && [ok boolValue]) {
+        [self clearUsageBackoff];
+        [self storeLastGoodState:fresh];
+        return fresh;
+    }
+    // Built but unusable (e.g. no rate-limit windows): keep prior good numbers.
+    return [self stateForFailure:fresh[@"error"] ?: @"Usage response was incomplete"];
+}
+
+// Once we've seen real numbers, never flash "unavailable" again: serve the last
+// good snapshot (marked stale) on any failure. Only a cold start shows an error.
+- (NSDictionary *)stateForFailure:(NSString *)message {
+    if (self.lastGoodState != nil) {
+        return [self staleStateFromGood:self.lastGoodState];
+    }
+    return [self errorStateWithMessage:message];
+}
+
+- (NSDictionary *)staleStateFromGood:(NSDictionary *)good {
+    NSMutableDictionary *state = [good mutableCopy];
+    state[@"updated_summary"] = [self stalenessSummary];
+    return state;
+}
+
+- (NSString *)stalenessSummary {
+    if (self.lastGoodFetchedAt == nil) {
+        return @"Updated: unknown";
+    }
+    NSTimeInterval ago = -[self.lastGoodFetchedAt timeIntervalSinceNow];
+    if (ago < 60.0) {
+        return @"Updated: just now";
+    }
+    NSInteger minutes = (NSInteger)(ago / 60.0);
+    if (minutes < 60) {
+        return [NSString stringWithFormat:@"Updated: %ldm ago", (long)minutes];
+    }
+    return [NSString stringWithFormat:@"Updated: %ldh ago", (long)(minutes / 60)];
+}
+
+- (void)storeLastGoodState:(NSDictionary *)state {
+    self.lastGoodState = state;
+    self.lastGoodFetchedAt = [NSDate date];
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    [defaults setObject:state forKey:LastGoodStateKey];
+    [defaults setDouble:self.lastGoodFetchedAt.timeIntervalSince1970 forKey:LastGoodFetchedAtKey];
+}
+
+- (void)restoreLastGoodState {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    NSDictionary *saved = [defaults dictionaryForKey:LastGoodStateKey];
+    double fetchedAt = [defaults doubleForKey:LastGoodFetchedAtKey];
+    if (![saved isKindOfClass:[NSDictionary class]] || fetchedAt <= 0) {
+        return;
+    }
+    self.lastGoodState = saved;
+    self.lastGoodFetchedAt = [NSDate dateWithTimeIntervalSince1970:fetchedAt];
+    self.latestState = [self staleStateFromGood:saved];
+}
+
+// Exponential cool-down (honoring Retry-After when the server sends a real one),
+// capped so we always recover. retryAfter <= 0 means "no useful hint" -> backoff.
+- (void)enterUsageBackoffWithRetryAfter:(NSTimeInterval)retryAfter {
+    NSTimeInterval wait;
+    if (retryAfter > 0) {
+        wait = MIN(retryAfter, UsageBackoffMaxSeconds);
+    } else {
+        NSTimeInterval next = self.usageBackoffSeconds > 0
+            ? self.usageBackoffSeconds * 2.0
+            : MAX([self refreshIntervalSeconds], 30.0);
+        wait = MIN(next, UsageBackoffMaxSeconds);
+    }
+    self.usageBackoffSeconds = wait;
+    self.usageBackoffUntil = [NSDate dateWithTimeIntervalSinceNow:wait];
+}
+
+- (void)clearUsageBackoff {
+    self.usageBackoffSeconds = 0;
+    self.usageBackoffUntil = nil;
 }
 
 - (NSDictionary *)errorStateWithMessage:(NSString *)message {
@@ -881,14 +990,14 @@ static NSString * const OAuthBetaHeader = @"oauth-2025-04-20";
 
 #pragma mark - HTTP helpers (synchronous, run on a background queue)
 
-- (NSData *)getURL:(NSString *)urlString bearer:(NSString *)bearer statusCode:(NSInteger *)statusCode error:(NSString **)error {
+- (NSData *)getURL:(NSString *)urlString bearer:(NSString *)bearer statusCode:(NSInteger *)statusCode retryAfter:(NSTimeInterval *)retryAfter error:(NSString **)error {
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlString]];
     request.HTTPMethod = @"GET";
     request.timeoutInterval = 10.0;
     [request setValue:[NSString stringWithFormat:@"Bearer %@", bearer] forHTTPHeaderField:@"Authorization"];
     [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
     [request setValue:OAuthBetaHeader forHTTPHeaderField:@"anthropic-beta"];
-    return [self sendRequest:request statusCode:statusCode error:error];
+    return [self sendRequest:request statusCode:statusCode retryAfter:retryAfter error:error];
 }
 
 - (NSData *)postURL:(NSString *)urlString jsonBody:(NSDictionary *)body statusCode:(NSInteger *)statusCode error:(NSString **)error {
@@ -898,12 +1007,13 @@ static NSString * const OAuthBetaHeader = @"oauth-2025-04-20";
     [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
     [request setValue:OAuthBetaHeader forHTTPHeaderField:@"anthropic-beta"];
     request.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
-    return [self sendRequest:request statusCode:statusCode error:error];
+    return [self sendRequest:request statusCode:statusCode retryAfter:NULL error:error];
 }
 
-- (NSData *)sendRequest:(NSURLRequest *)request statusCode:(NSInteger *)statusCode error:(NSString **)error {
+- (NSData *)sendRequest:(NSURLRequest *)request statusCode:(NSInteger *)statusCode retryAfter:(NSTimeInterval *)retryAfter error:(NSString **)error {
     __block NSData *resultData = nil;
     __block NSInteger resultStatus = 0;
+    __block NSTimeInterval resultRetryAfter = 0;
     __block NSString *resultError = nil;
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
 
@@ -914,7 +1024,12 @@ static NSString * const OAuthBetaHeader = @"oauth-2025-04-20";
         } else {
             resultData = data;
             if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
-                resultStatus = ((NSHTTPURLResponse *)response).statusCode;
+                NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
+                resultStatus = http.statusCode;
+                id rawRetryAfter = http.allHeaderFields[@"Retry-After"];
+                if ([rawRetryAfter respondsToSelector:@selector(doubleValue)]) {
+                    resultRetryAfter = [rawRetryAfter doubleValue];
+                }
             }
         }
         dispatch_semaphore_signal(done);
@@ -932,6 +1047,9 @@ static NSString * const OAuthBetaHeader = @"oauth-2025-04-20";
 
     if (statusCode) {
         *statusCode = resultStatus;
+    }
+    if (retryAfter) {
+        *retryAfter = resultRetryAfter;
     }
     if (error && resultError != nil) {
         *error = resultError;
