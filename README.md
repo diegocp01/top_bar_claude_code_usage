@@ -5,9 +5,9 @@ timing next to the clock. It is a port of the Codex usage menu bar, rebuilt for
 Claude Code.
 
 <p align="left">
-  <img src="docs/widget-percentage.png" alt="Percentage display" height="34">
+  <img src="docs/widget-percentage.png" alt="Percentage display" height="43">
   &nbsp;&nbsp;
-  <img src="docs/widget-battery.png" alt="Battery display with countdown" height="34">
+  <img src="docs/widget-battery.png" alt="Battery display with countdown" height="43">
 </p>
 
 The app reads your Claude Code login from the macOS keychain item
