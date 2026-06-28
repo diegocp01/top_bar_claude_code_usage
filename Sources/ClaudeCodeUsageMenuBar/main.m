@@ -353,7 +353,7 @@ static NSString * const OAuthBetaHeader = @"oauth-2025-04-20";
 - (NSString *)resetClockDetailForState:(NSDictionary *)state {
     NSString *clock = [self resetClockTextForWidgetState:state];
     if (clock.length == 0) {
-        return @"Reset time: unknown";
+        return [NSString stringWithFormat:@"Reset time: %@", [self missingResetReasonForState:state]];
     }
     return [NSString stringWithFormat:@"Reset time: %@", clock];
 }
@@ -361,9 +361,21 @@ static NSString * const OAuthBetaHeader = @"oauth-2025-04-20";
 - (NSString *)countdownDetailForState:(NSDictionary *)state {
     NSString *countdown = [self countdownTextForWidgetState:state];
     if (countdown.length == 0) {
-        return @"Countdown: unknown";
+        return [NSString stringWithFormat:@"Countdown: %@", [self missingResetReasonForState:state]];
     }
     return [NSString stringWithFormat:@"Countdown: %@", countdown];
+}
+
+// The selected window can have valid usage but no reset timestamp: the 5h
+// session window only has a reset_at once it's active. Distinguish that idle
+// case ("no active session") from a genuine unavailable response ("unknown").
+- (NSString *)missingResetReasonForState:(NSDictionary *)state {
+    NSNumber *ok = state[@"ok"];
+    BOOL haveUsage = !isnan([self widgetUsagePercentForState:state]);
+    if ([ok respondsToSelector:@selector(boolValue)] && [ok boolValue] && haveUsage) {
+        return [[self widgetWindowMode] isEqualToString:WidgetWindowWeekly] ? @"no active window" : @"no active session";
+    }
+    return @"unknown";
 }
 
 - (double)usagePercentForState:(NSDictionary *)state {
