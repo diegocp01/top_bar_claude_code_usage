@@ -17,11 +17,23 @@ static NSString * const WidgetWindowSession = @"session";
 static NSString * const WidgetWindowWeekly = @"weekly";
 static NSString * const RefreshIntervalKey = @"refreshIntervalSeconds";
 static NSTimeInterval const DefaultRefreshIntervalSeconds = 300.0;
+// Re-read the keychain this long before the cached token expires. Slightly wider
+// than the 60s window validAccessTokenFromCredentials uses to refresh, so we
+// pick up a token the CLI already rotated instead of spending our own refresh.
+static NSTimeInterval const CredentialCacheSkewSeconds = 120.0;
+// Floor between keychain reads. Without it, an expired token the CLI hasn't
+// replaced yet would send us back to the keychain on every single poll.
+static NSTimeInterval const KeychainReadMinIntervalSeconds = 120.0;
+// Past this much staleness the cached numbers are old enough to mislead, so the
+// menu bar stops rendering them as if they were current.
+static NSTimeInterval const StaleDisplayThresholdSeconds = 600.0;
 
 // Persisted last-good usage snapshot, so the widget keeps showing real numbers
 // even while the API is unreachable or rate-limiting us.
 static NSString * const LastGoodStateKey = @"lastGoodState";
 static NSString * const LastGoodFetchedAtKey = @"lastGoodFetchedAt";
+static NSString * const LastErrorKey = @"lastError";
+static NSString * const LastErrorAtKey = @"lastErrorAt";
 // Upper bound on how long we back off the network after repeated failures.
 static NSTimeInterval const UsageBackoffMaxSeconds = 600.0;
 
@@ -31,6 +43,9 @@ static NSString * const OAuthClientID = @"9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 static NSString * const OAuthTokenURL = @"https://platform.claude.com/v1/oauth/token";
 static NSString * const UsageURL = @"https://api.anthropic.com/api/oauth/usage";
 static NSString * const OAuthBetaHeader = @"oauth-2025-04-20";
+// Cloudflare rejects URLSession's default client signature on the OAuth token
+// endpoint. Identify this as an external Claude CLI companion on every request.
+static NSString * const HTTPUserAgent = @"claude-cli/0.1.0 (external, menu-bar)";
 
 @interface AppDelegate : NSObject <NSApplicationDelegate, NSMenuDelegate>
 @property(nonatomic, strong) NSStatusItem *statusItem;
@@ -40,6 +55,13 @@ static NSString * const OAuthBetaHeader = @"oauth-2025-04-20";
 @property(nonatomic, strong) NSImage *claudeIcon;
 @property(nonatomic, copy) NSString *launchAtLoginError;
 @property(nonatomic, strong) NSDate *refreshBackoffUntil;
+// Credentials live in memory between polls. Every keychain read can raise a
+// system password prompt — the Claude Code CLI rewrites the shared item when it
+// rotates tokens, which drops our "Always Allow" grant — so at a 30s poll
+// interval, reading per-poll means a prompt storm. Cached, we read roughly once
+// per token lifetime instead.
+@property(nonatomic, strong) NSDictionary *cachedCredentials;
+@property(nonatomic, strong) NSDate *lastKeychainReadAt;
 // Last successful usage snapshot + when we got it, and the network cool-down
 // the API has effectively imposed on us (e.g. after a 429).
 @property(nonatomic, strong) NSDictionary *lastGoodState;
@@ -196,10 +218,12 @@ static NSString * const OAuthBetaHeader = @"oauth-2025-04-20";
     }
 
     NSNumber *ok = state[@"ok"];
-    if ([ok respondsToSelector:@selector(boolValue)] && ![ok boolValue] &&
+    BOOL stale = [state[@"stale"] respondsToSelector:@selector(boolValue)] && [state[@"stale"] boolValue];
+    if ((([ok respondsToSelector:@selector(boolValue)] && ![ok boolValue]) || stale) &&
         [state[@"error"] isKindOfClass:[NSString class]]) {
         [menu addItem:[NSMenuItem separatorItem]];
-        [self addDisabledItem:[NSString stringWithFormat:@"Error: %@", state[@"error"]] toMenu:menu];
+        NSString *prefix = stale ? @"Refresh failed" : @"Error";
+        [self addDisabledItem:[NSString stringWithFormat:@"%@: %@", prefix, state[@"error"]] toMenu:menu];
     }
 
     [menu addItem:[NSMenuItem separatorItem]];
@@ -321,24 +345,47 @@ static NSString * const OAuthBetaHeader = @"oauth-2025-04-20";
 
     double metric = [self displayPercentForWidgetState:state];
     NSString *timeText = [self timeTextForWidgetState:state];
+    BOOL stale = [self displayIsStale];
 
     if ([[self displayMode] isEqualToString:DisplayModeBattery]) {
-        self.statusItem.button.image = [self batteryIconForPercent:metric];
-        self.statusItem.button.title = timeText;
+        // Never draw a stale snapshot as a battery level: an hours-old "0% used"
+        // renders as a full charge, which reads as good news rather than as no
+        // news. Fall back to the plain icon plus a stale marker.
+        self.statusItem.button.image = stale ? self.claudeIcon : [self batteryIconForPercent:metric];
+        self.statusItem.button.title = stale ? [self staleMarkedTitle:timeText] : timeText;
         return;
     }
 
     self.statusItem.button.image = self.claudeIcon;
+    NSString *title = nil;
     if (isnan(metric)) {
-        self.statusItem.button.title = timeText.length > 0 ? timeText : @"--";
+        title = timeText.length > 0 ? timeText : @"--";
     } else {
         NSString *metricLabel = [self metricLabel];
         if (metricLabel.length > 0) {
-            self.statusItem.button.title = [NSString stringWithFormat:@"%@ | %.0f%% %@", timeText, metric, metricLabel];
+            title = [NSString stringWithFormat:@"%@ | %.0f%% %@", timeText, metric, metricLabel];
         } else {
-            self.statusItem.button.title = [NSString stringWithFormat:@"%@ | %.0f%%", timeText, metric];
+            title = [NSString stringWithFormat:@"%@ | %.0f%%", timeText, metric];
         }
     }
+    self.statusItem.button.title = stale ? [self staleMarkedTitle:title] : title;
+}
+
+// Stale for a few minutes is just a missed poll; stale for longer means the
+// numbers on screen are no longer describing the current session.
+- (BOOL)displayIsStale {
+    NSDictionary *state = self.latestState;
+    if (![state[@"stale"] respondsToSelector:@selector(boolValue)] || ![state[@"stale"] boolValue]) {
+        return NO;
+    }
+    if (self.lastGoodFetchedAt == nil) {
+        return YES;
+    }
+    return -[self.lastGoodFetchedAt timeIntervalSinceNow] > StaleDisplayThresholdSeconds;
+}
+
+- (NSString *)staleMarkedTitle:(NSString *)title {
+    return title.length > 0 ? [NSString stringWithFormat:@"⚠ %@", title] : @"⚠";
 }
 
 - (NSString *)detailUsageTextForState:(NSDictionary *)state {
@@ -370,6 +417,13 @@ static NSString * const OAuthBetaHeader = @"oauth-2025-04-20";
 // session window only has a reset_at once it's active. Distinguish that idle
 // case ("no active session") from a genuine unavailable response ("unknown").
 - (NSString *)missingResetReasonForState:(NSDictionary *)state {
+    if ([state[@"stale"] respondsToSelector:@selector(boolValue)] && [state[@"stale"] boolValue]) {
+        return @"stale";
+    }
+    NSNumber *reset = [self widgetResetSecondsForState:state];
+    if (reset != nil && reset.doubleValue <= [NSDate date].timeIntervalSince1970) {
+        return @"expired";
+    }
     NSNumber *ok = state[@"ok"];
     BOOL haveUsage = !isnan([self widgetUsagePercentForState:state]);
     if ([ok respondsToSelector:@selector(boolValue)] && [ok boolValue] && haveUsage) {
@@ -435,7 +489,7 @@ static NSString * const OAuthBetaHeader = @"oauth-2025-04-20";
 
 - (NSString *)resetClockTextForWidgetState:(NSDictionary *)state {
     NSNumber *seconds = [self widgetResetSecondsForState:state];
-    if (seconds == nil) {
+    if (seconds == nil || seconds.doubleValue <= [NSDate date].timeIntervalSince1970) {
         return nil;
     }
 
@@ -452,7 +506,10 @@ static NSString * const OAuthBetaHeader = @"oauth-2025-04-20";
         return nil;
     }
 
-    NSInteger remaining = MAX(0, (NSInteger)llround(seconds.doubleValue - [NSDate date].timeIntervalSince1970));
+    NSInteger remaining = (NSInteger)llround(seconds.doubleValue - [NSDate date].timeIntervalSince1970);
+    if (remaining <= 0) {
+        return nil;
+    }
     NSInteger hours = remaining / 3600;
     NSInteger minutes = (remaining % 3600) / 60;
     NSInteger secs = remaining % 60;
@@ -591,11 +648,14 @@ static NSString * const OAuthBetaHeader = @"oauth-2025-04-20";
     // the last good numbers until the cool-down passes. The display still ticks.
     if (self.usageBackoffUntil != nil && [self.usageBackoffUntil timeIntervalSinceNow] > 0 &&
         self.lastGoodState != nil) {
-        return [self staleStateFromGood:self.lastGoodState];
+        NSString *message = [self.latestState[@"error"] isKindOfClass:[NSString class]]
+            ? self.latestState[@"error"]
+            : @"Waiting to retry after a failed refresh";
+        return [self staleStateFromGood:self.lastGoodState failure:message];
     }
 
     NSString *credsError = nil;
-    NSDictionary *creds = [self readKeychainCredentials:&credsError];
+    NSDictionary *creds = [self credentialsReloading:NO error:&credsError];
     if (creds == nil) {
         return [self stateForFailure:credsError ?: @"Claude Code credentials not found"];
     }
@@ -611,13 +671,23 @@ static NSString * const OAuthBetaHeader = @"oauth-2025-04-20";
     NSTimeInterval retryAfter = 0;
     NSData *data = [self getURL:UsageURL bearer:accessToken statusCode:&status retryAfter:&retryAfter error:&httpError];
 
-    // A 401 can mean the cached token went stale mid-flight; try one forced refresh.
+    // A 401 means the token we used is stale. Prefer a token the CLI may have
+    // rotated in behind us — that costs nothing — and only spend our own refresh
+    // if the keychain has nothing newer than what we just tried.
     if (status == 401) {
-        NSString *refreshError = nil;
-        NSString *refreshed = [self refreshAccessTokenWithCredentials:creds error:&refreshError];
-        if (refreshed.length > 0) {
-            data = [self getURL:UsageURL bearer:refreshed statusCode:&status retryAfter:&retryAfter error:&httpError];
-            accessToken = refreshed;
+        NSDictionary *freshCreds = [self credentialsReloading:YES error:NULL];
+        if (freshCreds != nil) {
+            creds = freshCreds;
+        }
+
+        NSString *keychainToken = [self stringFromDictionary:creds keys:@[@"accessToken"]];
+        NSString *retryToken = (keychainToken.length > 0 && ![keychainToken isEqualToString:accessToken])
+            ? keychainToken
+            : [self refreshAccessTokenWithCredentials:creds error:NULL];
+
+        if (retryToken.length > 0) {
+            data = [self getURL:UsageURL bearer:retryToken statusCode:&status retryAfter:&retryAfter error:&httpError];
+            accessToken = retryToken;
         }
     }
 
@@ -653,14 +723,22 @@ static NSString * const OAuthBetaHeader = @"oauth-2025-04-20";
 // Once we've seen real numbers, never flash "unavailable" again: serve the last
 // good snapshot (marked stale) on any failure. Only a cold start shows an error.
 - (NSDictionary *)stateForFailure:(NSString *)message {
+    // Failures are otherwise invisible — they hide behind the stale snapshot.
+    // Record the last one so it can be inspected without attaching a debugger.
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    [defaults setObject:(message.length > 0 ? message : @"Refresh failed") forKey:LastErrorKey];
+    [defaults setDouble:[NSDate date].timeIntervalSince1970 forKey:LastErrorAtKey];
+
     if (self.lastGoodState != nil) {
-        return [self staleStateFromGood:self.lastGoodState];
+        return [self staleStateFromGood:self.lastGoodState failure:message];
     }
     return [self errorStateWithMessage:message];
 }
 
-- (NSDictionary *)staleStateFromGood:(NSDictionary *)good {
+- (NSDictionary *)staleStateFromGood:(NSDictionary *)good failure:(NSString *)message {
     NSMutableDictionary *state = [good mutableCopy];
+    state[@"stale"] = @YES;
+    state[@"error"] = message.length > 0 ? message : @"Refresh failed";
     state[@"updated_summary"] = [self stalenessSummary];
     return state;
 }
@@ -697,7 +775,7 @@ static NSString * const OAuthBetaHeader = @"oauth-2025-04-20";
     }
     self.lastGoodState = saved;
     self.lastGoodFetchedAt = [NSDate dateWithTimeIntervalSince1970:fetchedAt];
-    self.latestState = [self staleStateFromGood:saved];
+    self.latestState = [self staleStateFromGood:saved failure:@"Waiting for a fresh update"];
 }
 
 // Exponential cool-down (honoring Retry-After when the server sends a real one),
@@ -835,6 +913,42 @@ static NSString * const OAuthBetaHeader = @"oauth-2025-04-20";
 
 #pragma mark - Keychain + OAuth
 
+- (BOOL)cachedCredentialsAreUsable {
+    if (self.cachedCredentials == nil) {
+        return NO;
+    }
+    NSString *accessToken = [self stringFromDictionary:self.cachedCredentials keys:@[@"accessToken"]];
+    if (accessToken.length == 0) {
+        return NO;
+    }
+    NSNumber *expiresAt = [self numberFromDictionary:self.cachedCredentials keys:@[@"expiresAt"]];
+    return expiresAt == nil ||
+        [NSDate date].timeIntervalSince1970 < (expiresAt.doubleValue / 1000.0) - CredentialCacheSkewSeconds;
+}
+
+// Access tokens are good for about an hour, so one keychain read serves a few
+// hundred polls. Pass forceReload when the cache is known-bad (a 401).
+- (NSDictionary *)credentialsReloading:(BOOL)forceReload error:(NSString **)error {
+    if (!forceReload && [self cachedCredentialsAreUsable]) {
+        return self.cachedCredentials;
+    }
+
+    // Rate-limit the keychain itself. Once the cached token expires we want the
+    // CLI's replacement, but if the CLI is idle there isn't one yet — and asking
+    // again every poll is what turns one lost grant into a prompt storm.
+    if (self.cachedCredentials != nil && self.lastKeychainReadAt != nil &&
+        -[self.lastKeychainReadAt timeIntervalSinceNow] < KeychainReadMinIntervalSeconds) {
+        return self.cachedCredentials;
+    }
+
+    self.lastKeychainReadAt = [NSDate date];
+    NSDictionary *creds = [self readKeychainCredentials:error];
+    if (creds != nil) {
+        self.cachedCredentials = creds;
+    }
+    return creds;
+}
+
 - (NSDictionary *)readKeychainCredentials:(NSString **)error {
     NSDictionary *query = @{
         (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
@@ -871,6 +985,11 @@ static NSString * const OAuthBetaHeader = @"oauth-2025-04-20";
     return oauth;
 }
 
+// Nothing else refreshes this keychain item — the Claude Code CLI can go a day
+// without touching it — so the widget has to do it or the token simply expires
+// and the display freezes. Refresh only when actually expired (~hourly), and
+// always write the rotated token back: reusing a spent refresh token is what
+// earns an invalid_grant.
 - (NSString *)validAccessTokenFromCredentials:(NSDictionary *)creds error:(NSString **)error {
     NSString *accessToken = [self stringFromDictionary:creds keys:@[@"accessToken"]];
     NSNumber *expiresAt = [self numberFromDictionary:creds keys:@[@"expiresAt"]];
@@ -892,8 +1011,8 @@ static NSString * const OAuthBetaHeader = @"oauth-2025-04-20";
         return refreshed;
     }
 
-    if (accessToken.length > 0) {
-        // Couldn't refresh, but try the (possibly stale) token rather than nothing.
+    if (accessToken.length > 0 && expiresAt == nil) {
+        // If the credential has no expiry metadata, let the API validate it.
         return accessToken;
     }
     if (error) {
@@ -986,6 +1105,12 @@ static NSString * const OAuthBetaHeader = @"oauth-2025-04-20";
     oauth[@"refreshToken"] = refreshToken;
     oauth[@"expiresAt"] = @((long long)llround(expiresAtMs));
 
+    // Update the in-memory copy FIRST, and unconditionally. Refresh tokens are
+    // single-use: if the cache kept the spent one, the next poll would refresh
+    // again with it and the server would answer invalid_grant, permanently
+    // wedging the widget until the user re-ran `claude /login`.
+    self.cachedCredentials = [oauth copy];
+
     NSDictionary *root = @{@"claudeAiOauth": oauth};
     NSData *data = [NSJSONSerialization dataWithJSONObject:root options:0 error:nil];
     if (data == nil) {
@@ -1006,6 +1131,7 @@ static NSString * const OAuthBetaHeader = @"oauth-2025-04-20";
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlString]];
     request.HTTPMethod = @"GET";
     request.timeoutInterval = 10.0;
+    [request setValue:HTTPUserAgent forHTTPHeaderField:@"User-Agent"];
     [request setValue:[NSString stringWithFormat:@"Bearer %@", bearer] forHTTPHeaderField:@"Authorization"];
     [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
     [request setValue:OAuthBetaHeader forHTTPHeaderField:@"anthropic-beta"];

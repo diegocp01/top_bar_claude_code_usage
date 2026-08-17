@@ -93,8 +93,11 @@ To remove it:
 4. Map `five_hour` → the session window and `seven_day` → the weekly window.
    `utilization` is a 0–100 percentage; `resets_at` is an ISO-8601 timestamp.
 
-If anything fails (not signed in, keychain denied, offline, rate-limited), the
-menu shows an explanatory `Error:` line and the bar shows `--`.
+If a refresh fails after the app has already fetched usage, it keeps the
+last-good percentages but marks them stale, shows the refresh error in the menu,
+and replaces an expired reset time/countdown with `--` / `--:--`. On a cold
+start with no cached usage, the menu shows an explanatory `Error:` line and the
+bar shows `--`.
 
 ## Notes
 
