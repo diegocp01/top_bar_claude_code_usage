@@ -48,19 +48,26 @@ open ".build/release/Claude Code Usage Menu Bar.app"
 ```
 
 The build script produces a universal Apple Silicon/Intel `.app` bundle and
-ad-hoc signs it for local use. This local build is not notarized.
+signs it with your code-signing identity if you have one (ad-hoc otherwise).
+This local build is not notarized.
 
-### First-run keychain prompt
+### Keychain access (no password prompts)
 
-The first time the app reads your Claude Code credentials, macOS shows a
-keychain prompt:
+The app never touches the keychain directly. It reads and writes
+`Claude Code-credentials` through `/usr/bin/security` — the same tool, and the
+same commands, Claude Code itself uses. That item already trusts
+`/usr/bin/security`, so there is no prompt to approve, rebuilding doesn't
+matter, and the item's access list is never modified.
 
-> "Claude Code Usage Menu Bar" wants to use information stored in
-> "Claude Code-credentials" in your keychain.
+Earlier versions wrote the item with `SecItemUpdate`, which replaced its
+partition list with this app's identity and locked Claude Code out: the Claude
+desktop app / CLI then asked for your login password on every launch. If that
+happened to you, click **Always Allow** once on the next prompt that names
+`security`, or restore it directly (asks for your login password):
 
-Click **Always Allow**. Because local builds are ad-hoc signed, the prompt
-re-appears after every rebuild (each build has a different signature). Once you
-settle on a build and stop rebuilding, the approval sticks.
+```sh
+security set-generic-password-partition-list -s "Claude Code-credentials" -S apple-tool:
+```
 
 ## Launch at Login
 
@@ -83,11 +90,14 @@ To remove it:
 ## How it works
 
 1. Read the `Claude Code-credentials` generic-password item from the keychain
-   (`SecItemCopyMatching`).
+   (`security find-generic-password -w`), cached in memory for the token's
+   lifetime.
 2. If the OAuth access token is expired (or about to expire), refresh it against
    `https://platform.claude.com/v1/oauth/token` using the stored refresh token,
-   then write the rotated tokens back to the same keychain item so the CLI and
-   this widget stay in sync.
+   then write the rotated tokens back to the same keychain item
+   (`security -i` ← `add-generic-password -U … -X <hex>`, so the token never
+   appears in `ps`) so the CLI and this widget stay in sync. Refresh tokens are
+   single-use, so the write is read back and verified.
 3. `GET https://api.anthropic.com/api/oauth/usage` with the bearer token and the
    `anthropic-beta: oauth-2025-04-20` header.
 4. Map `five_hour` → the session window and `seven_day` → the weekly window.

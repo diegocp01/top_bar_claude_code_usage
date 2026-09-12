@@ -1,6 +1,5 @@
 #import <Cocoa/Cocoa.h>
 #import <ServiceManagement/ServiceManagement.h>
-#import <Security/Security.h>
 #import <math.h>
 
 static NSString * const DisplayModeKey = @"displayMode";
@@ -39,6 +38,19 @@ static NSTimeInterval const UsageBackoffMaxSeconds = 600.0;
 
 // Claude Code OAuth configuration (matches the Claude Code CLI production config).
 static NSString * const KeychainService = @"Claude Code-credentials";
+// All keychain access goes through /usr/bin/security, exactly as Claude Code
+// does. The item's access list trusts that tool (partition "apple-tool:"), so
+// reads never prompt, and writes leave the access list untouched. Writing with
+// SecItemUpdate from this app instead stamped the item's partition list with
+// this app's Team ID, which evicted Claude Code: it then asked for the login
+// password on every launch, and "Always Allow" only helped until our next write.
+static NSString * const SecurityToolPath = @"/usr/bin/security";
+static int const SecurityExitItemNotFound = 44;
+// `security -i` reads commands into a fixed line buffer. A longer line is not
+// rejected — it is truncated and the truncated bytes get STORED. Stay well under.
+static NSUInteger const SecurityInteractiveLineLimit = 3500;
+// A pending keychain dialog blocks the tool; never let that wedge polling.
+static NSTimeInterval const SecurityToolTimeoutSeconds = 30.0;
 static NSString * const OAuthClientID = @"9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 static NSString * const OAuthTokenURL = @"https://platform.claude.com/v1/oauth/token";
 static NSString * const UsageURL = @"https://api.anthropic.com/api/oauth/usage";
@@ -55,11 +67,8 @@ static NSString * const HTTPUserAgent = @"claude-cli/0.1.0 (external, menu-bar)"
 @property(nonatomic, strong) NSImage *claudeIcon;
 @property(nonatomic, copy) NSString *launchAtLoginError;
 @property(nonatomic, strong) NSDate *refreshBackoffUntil;
-// Credentials live in memory between polls. Every keychain read can raise a
-// system password prompt — the Claude Code CLI rewrites the shared item when it
-// rotates tokens, which drops our "Always Allow" grant — so at a 30s poll
-// interval, reading per-poll means a prompt storm. Cached, we read roughly once
-// per token lifetime instead.
+// Credentials live in memory between polls, so the keychain is read roughly once
+// per token lifetime instead of on every poll.
 @property(nonatomic, strong) NSDictionary *cachedCredentials;
 @property(nonatomic, strong) NSDate *lastKeychainReadAt;
 // Last successful usage snapshot + when we got it, and the network cool-down
@@ -949,32 +958,111 @@ static NSString * const HTTPUserAgent = @"claude-cli/0.1.0 (external, menu-bar)"
     return creds;
 }
 
-- (NSDictionary *)readKeychainCredentials:(NSString **)error {
-    NSDictionary *query = @{
-        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
-        (__bridge id)kSecAttrService: KeychainService,
-        (__bridge id)kSecReturnData: @YES,
-        (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitOne
-    };
+// Runs /usr/bin/security and returns its exit status, or -1 if it could not be
+// launched or had to be killed after SecurityToolTimeoutSeconds. stderr is
+// discarded; stdout is returned through `output`.
+- (int)runSecurityWithArguments:(NSArray<NSString *> *)arguments
+                          input:(NSData *)input
+                         output:(NSData **)output {
+    NSTask *task = [[NSTask alloc] init];
+    task.executableURL = [NSURL fileURLWithPath:SecurityToolPath];
+    task.arguments = arguments;
+    NSPipe *outPipe = [NSPipe pipe];
+    NSPipe *inPipe = input != nil ? [NSPipe pipe] : nil;
+    task.standardOutput = outPipe;
+    task.standardError = [NSFileHandle fileHandleWithNullDevice];
+    task.standardInput = inPipe ?: (id)[NSFileHandle fileHandleWithNullDevice];
 
-    CFTypeRef result = NULL;
-    OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, &result);
-    if (status != errSecSuccess || result == NULL) {
+    dispatch_semaphore_t exited = dispatch_semaphore_create(0);
+    task.terminationHandler = ^(NSTask *finished) {
+        (void)finished;
+        dispatch_semaphore_signal(exited);
+    };
+    if (![task launchAndReturnError:NULL]) {
+        return -1;
+    }
+
+    // Drain stdout concurrently so a large reply can't fill the pipe and stall.
+    __block NSData *outData = nil;
+    dispatch_semaphore_t drained = dispatch_semaphore_create(0);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        outData = [outPipe.fileHandleForReading readDataToEndOfFile];
+        dispatch_semaphore_signal(drained);
+    });
+    if (inPipe != nil) {
+        [inPipe.fileHandleForWriting writeData:input error:NULL];
+        [inPipe.fileHandleForWriting closeAndReturnError:NULL];
+    }
+
+    dispatch_time_t deadline = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(SecurityToolTimeoutSeconds * NSEC_PER_SEC));
+    BOOL timedOut = dispatch_semaphore_wait(exited, deadline) != 0;
+    if (timedOut) {
+        [task terminate];
+        dispatch_semaphore_wait(exited, DISPATCH_TIME_FOREVER);
+    }
+    dispatch_semaphore_wait(drained, DISPATCH_TIME_FOREVER);
+    if (timedOut) {
+        return -1;
+    }
+    if (output) {
+        *output = outData;
+    }
+    return task.terminationStatus;
+}
+
+// The whole stored JSON document (Claude Code nests the OAuth tokens under
+// "claudeAiOauth" and may keep other keys alongside them).
+- (NSDictionary *)readKeychainRoot:(NSString **)error {
+    NSData *data = nil;
+    int status = [self runSecurityWithArguments:@[@"find-generic-password", @"-s", KeychainService, @"-w"]
+                                          input:nil
+                                         output:&data];
+    if (status != 0 || data.length == 0) {
         if (error) {
-            if (status == errSecItemNotFound) {
+            if (status == SecurityExitItemNotFound) {
                 *error = @"Not signed in to Claude Code (no keychain item)";
-            } else if (status == errSecUserCanceled || status == errSecAuthFailed) {
-                *error = @"Keychain access denied";
+            } else if (status == -1) {
+                *error = @"Keychain read timed out";
             } else {
-                *error = [NSString stringWithFormat:@"Keychain error %d", (int)status];
+                *error = [NSString stringWithFormat:@"Keychain read failed (security exit %d)", status];
             }
         }
         return nil;
     }
 
-    NSData *data = (__bridge_transfer NSData *)result;
     id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-    NSDictionary *root = [json isKindOfClass:[NSDictionary class]] ? json : nil;
+    if (![json isKindOfClass:[NSDictionary class]]) {
+        if (error) {
+            *error = @"Keychain credentials were not valid JSON";
+        }
+        return nil;
+    }
+    return json;
+}
+
+// The item's account attribute. An update must name the existing account, or
+// `add-generic-password -U` creates a second item instead of replacing this one.
+- (NSString *)keychainAccount {
+    NSData *data = nil;
+    // Attributes only (no -w): this never touches the secret.
+    if ([self runSecurityWithArguments:@[@"find-generic-password", @"-s", KeychainService]
+                                 input:nil
+                                output:&data] != 0) {
+        return nil;
+    }
+    NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"\"acct\"<blob>=\"(.*)\"$"
+                                                                           options:NSRegularExpressionAnchorsMatchLines
+                                                                             error:NULL];
+    NSTextCheckingResult *match = text != nil ? [regex firstMatchInString:text options:0 range:NSMakeRange(0, text.length)] : nil;
+    return match != nil ? [text substringWithRange:[match rangeAtIndex:1]] : nil;
+}
+
+- (NSDictionary *)readKeychainCredentials:(NSString **)error {
+    NSDictionary *root = [self readKeychainRoot:error];
+    if (root == nil) {
+        return nil;
+    }
     NSDictionary *oauth = [root[@"claudeAiOauth"] isKindOfClass:[NSDictionary class]] ? root[@"claudeAiOauth"] : root;
     if (![oauth isKindOfClass:[NSDictionary class]]) {
         if (error) {
@@ -1111,18 +1199,59 @@ static NSString * const HTTPUserAgent = @"claude-cli/0.1.0 (external, menu-bar)"
     // wedging the widget until the user re-ran `claude /login`.
     self.cachedCredentials = [oauth copy];
 
-    NSDictionary *root = @{@"claudeAiOauth": oauth};
+    // Merge into what is stored now rather than rebuilding the item from our
+    // copy, so any other keys Claude Code keeps there survive.
+    NSMutableDictionary *root = [[self readKeychainRoot:NULL] mutableCopy];
+    if (root == nil) {
+        [self recordKeychainWriteFailure:@"could not read the item to update it"];
+        return;
+    }
+    root[@"claudeAiOauth"] = oauth;
     NSData *data = [NSJSONSerialization dataWithJSONObject:root options:0 error:nil];
-    if (data == nil) {
+    NSString *account = [self keychainAccount];
+    if (data == nil || account.length == 0) {
+        [self recordKeychainWriteFailure:@"could not determine the keychain account"];
         return;
     }
 
-    NSDictionary *query = @{
-        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
-        (__bridge id)kSecAttrService: KeychainService
-    };
-    NSDictionary *update = @{ (__bridge id)kSecValueData: data };
-    SecItemUpdate((__bridge CFDictionaryRef)query, (__bridge CFDictionaryRef)update);
+    // Same write Claude Code performs: hex-encoded (-X) over `security -i` stdin,
+    // so the tokens never appear in the process list.
+    NSMutableString *hex = [NSMutableString stringWithCapacity:data.length * 2];
+    const unsigned char *bytes = data.bytes;
+    for (NSUInteger i = 0; i < data.length; i++) {
+        [hex appendFormat:@"%02x", bytes[i]];
+    }
+    BOOL accountIsQuotable = [account rangeOfCharacterFromSet:[NSCharacterSet characterSetWithCharactersInString:@"\"\\\n"]].location == NSNotFound;
+    NSString *line = [NSString stringWithFormat:@"add-generic-password -U -a \"%@\" -s \"%@\" -X %@\n", account, KeychainService, hex];
+    int status;
+    if (accountIsQuotable && line.length <= SecurityInteractiveLineLimit) {
+        status = [self runSecurityWithArguments:@[@"-i"]
+                                          input:[line dataUsingEncoding:NSUTF8StringEncoding]
+                                         output:NULL];
+    } else {
+        // Too long for `security -i` (it would store a truncated value). Like
+        // Claude Code, fall back to argv, which briefly exposes it to `ps`.
+        status = [self runSecurityWithArguments:@[@"add-generic-password", @"-U", @"-a", account,
+                                                  @"-s", KeychainService, @"-X", hex]
+                                          input:nil
+                                         output:NULL];
+    }
+
+    // Refresh tokens are single-use, so a silently failed write strands Claude
+    // Code with a spent token. Verify by reading it back.
+    NSDictionary *stored = [self readKeychainCredentials:NULL];
+    NSString *storedRefresh = [self stringFromDictionary:stored keys:@[@"refreshToken"]];
+    if (status != 0 || ![storedRefresh isEqualToString:refreshToken]) {
+        [self recordKeychainWriteFailure:[NSString stringWithFormat:@"security exit %d", status]];
+    }
+}
+
+- (void)recordKeychainWriteFailure:(NSString *)reason {
+    NSString *message = [NSString stringWithFormat:@"Could not save refreshed token to keychain (%@)", reason];
+    NSLog(@"%@", message);
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    [defaults setObject:message forKey:LastErrorKey];
+    [defaults setDouble:[NSDate date].timeIntervalSince1970 forKey:LastErrorAtKey];
 }
 
 #pragma mark - HTTP helpers (synchronous, run on a background queue)
@@ -1300,6 +1429,9 @@ static NSString * const HTTPUserAgent = @"claude-cli/0.1.0 (external, menu-bar)"
 int main(int argc, const char *argv[]) {
     (void)argc;
     (void)argv;
+    // We feed /usr/bin/security over a pipe; if it ever exits before reading,
+    // the write must fail with EPIPE rather than kill the app.
+    signal(SIGPIPE, SIG_IGN);
 
     @autoreleasepool {
         NSApplication *app = [NSApplication sharedApplication];
