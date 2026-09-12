@@ -30,9 +30,27 @@ Click the menu-bar item to choose:
 - Percentage or battery display.
 - Percentage left or percentage used (default: percentage left).
 - Which window the menu-bar number tracks: **Session (5h)** or **Weekly (7d)**.
-- Reset clock time or a live countdown to reset.
+- Reset clock time or a live countdown to reset, or **Hide Time** for a compact
+  icon-and-battery item (percentage mode shows just the percentage). The
+  countdown and reset time stay in the dropdown.
 - Refresh interval: 30 seconds, 1 minute, 3 minutes, or 5 minutes.
 - Launch at Login, backed by `SMAppService`.
+
+### On-pace marker
+
+With **Show Battery** + **Show % Left**, a slim vertical line inside the battery
+shows how much quota would remain if usage were spread evenly across the window:
+
+`on-pace % left = (time until reset / window length) × 100`
+
+If the battery fill ends to the right of the line, you have more left than an
+even pace predicts. The usage API reports when a window resets but not when it
+started, so the window length is the fixed 5 hours (Session) or 7 days (Weekly).
+The line is hidden while there is no active window.
+
+The line and the percentage follow the same contrast rule: dark over the empty
+part of the battery, a cutout over the fill, so both stay visible in light and
+dark menu bars. Where the line passes beneath the percentage it softens to 55%.
 
 ## Requirements
 

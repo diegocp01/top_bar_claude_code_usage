@@ -8,12 +8,17 @@ static NSString * const DisplayModeBattery = @"battery";
 static NSString * const TimeModeKey = @"timeMode";
 static NSString * const TimeModeClock = @"clock";
 static NSString * const TimeModeCountdown = @"countdown";
+static NSString * const TimeModeHidden = @"hidden";
 static NSString * const MetricModeKey = @"metricMode";
 static NSString * const MetricModeLeft = @"left";
 static NSString * const MetricModeUsed = @"used";
 static NSString * const WidgetWindowModeKey = @"widgetWindowMode";
 static NSString * const WidgetWindowSession = @"session";
 static NSString * const WidgetWindowWeekly = @"weekly";
+// The usage API reports when a window resets but not when it began, so the
+// on-pace marker uses the fixed lengths the windows are named after.
+static NSTimeInterval const SessionWindowSeconds = 5.0 * 3600.0;
+static NSTimeInterval const WeeklyWindowSeconds = 7.0 * 24.0 * 3600.0;
 static NSString * const RefreshIntervalKey = @"refreshIntervalSeconds";
 static NSTimeInterval const DefaultRefreshIntervalSeconds = 300.0;
 // Re-read the keychain this long before the cached token expires. Slightly wider
@@ -149,7 +154,9 @@ static NSString * const HTTPUserAgent = @"claude-cli/0.1.0 (external, menu-bar)"
     }
 }
 
-- (NSImage *)batteryIconForPercent:(double)percent {
+// onPacePercent places the slim on-pace marker (see onPacePercentForWidgetState:);
+// pass NAN to omit it.
+- (NSImage *)batteryIconForPercent:(double)percent onPacePercent:(double)onPacePercent {
     double clamped = MAX(0.0, MIN(100.0, percent));
     NSImage *image = [[NSImage alloc] initWithSize:NSMakeSize(66.0, 18.0)];
 
@@ -166,10 +173,13 @@ static NSString * const HTTPUserAgent = @"claude-cli/0.1.0 (external, menu-bar)"
     NSRect nub = NSMakeRect(NSMaxX(body) + 1.0, 6.5, 2.0, 5.0);
     [[NSBezierPath bezierPathWithRoundedRect:nub xRadius:0.8 yRadius:0.8] fill];
 
-    CGFloat fillWidth = (CGFloat)((body.size.width - 4.0) * (clamped / 100.0));
+    NSRect interior = NSMakeRect(body.origin.x + 2.0, body.origin.y + 2.0, body.size.width - 4.0, body.size.height - 4.0);
+    CGFloat fillWidth = (CGFloat)(interior.size.width * (clamped / 100.0));
+    NSBezierPath *fillPath = nil;
     if (fillWidth > 0.5) {
-        NSRect fillRect = NSMakeRect(body.origin.x + 2.0, body.origin.y + 2.0, fillWidth, body.size.height - 4.0);
-        [[NSBezierPath bezierPathWithRoundedRect:fillRect xRadius:1.0 yRadius:1.0] fill];
+        NSRect fillRect = NSMakeRect(NSMinX(interior), NSMinY(interior), fillWidth, NSHeight(interior));
+        fillPath = [NSBezierPath bezierPathWithRoundedRect:fillRect xRadius:1.0 yRadius:1.0];
+        [fillPath fill];
     }
 
     NSString *number = [NSString stringWithFormat:@"%.0f", clamped];
@@ -180,7 +190,44 @@ static NSString * const HTTPUserAgent = @"claude-cli/0.1.0 (external, menu-bar)"
     NSSize numberSize = [number sizeWithAttributes:attributes];
     NSPoint numberPoint = NSMakePoint(NSMidX(body) - numberSize.width / 2.0,
                                       NSMidY(body) - numberSize.height / 2.0 - 0.5);
+
+    if (isfinite(onPacePercent)) {
+        CGFloat pace = MAX(0.0, MIN(100.0, onPacePercent));
+        CGFloat markerX = NSMinX(interior) + interior.size.width * (pace / 100.0);
+        markerX = floor(MAX(NSMinX(interior) + 0.5, MIN(NSMaxX(interior) - 0.5, markerX))) + 0.5;
+        NSRect marker = NSMakeRect(markerX - 0.5, NSMinY(interior), 1.0, NSHeight(interior));
+        NSRect numberBounds = NSMakeRect(numberPoint.x, numberPoint.y, numberSize.width, numberSize.height);
+        // Soften the marker where it runs beneath the digits so they stay legible.
+        CGFloat markerOpacity = (NSMinX(marker) < NSMaxX(numberBounds) && NSMaxX(marker) > NSMinX(numberBounds)) ? 0.55 : 1.0;
+        [NSGraphicsContext saveGraphicsState];
+        [[NSBezierPath bezierPathWithRoundedRect:interior xRadius:1.0 yRadius:1.0] addClip];
+        [[NSColor colorWithCalibratedWhite:0.0 alpha:markerOpacity] setFill];
+        NSRectFill(marker);
+        if (fillPath != nil) {
+            // Inside the fill the marker is a cutout, so it contrasts there too.
+            [fillPath addClip];
+            NSRectFillUsingOperation(marker, NSCompositingOperationClear);
+            [[NSColor colorWithCalibratedWhite:0.0 alpha:1.0 - markerOpacity] setFill];
+            NSRectFill(marker);
+        }
+        [NSGraphicsContext restoreGraphicsState];
+    }
+
+    // This is a template image: macOS tints everything one color, so digits drawn
+    // over the fill would vanish into it. Clear beneath the digits, draw them, then
+    // punch them out of the fill so each half shows the opposite menu-bar color.
+    [NSGraphicsContext saveGraphicsState];
+    NSGraphicsContext.currentContext.compositingOperation = NSCompositingOperationClear;
     [number drawAtPoint:numberPoint withAttributes:attributes];
+    [NSGraphicsContext restoreGraphicsState];
+    [number drawAtPoint:numberPoint withAttributes:attributes];
+    if (fillPath != nil) {
+        [NSGraphicsContext saveGraphicsState];
+        [fillPath addClip];
+        NSGraphicsContext.currentContext.compositingOperation = NSCompositingOperationClear;
+        [number drawAtPoint:numberPoint withAttributes:attributes];
+        [NSGraphicsContext restoreGraphicsState];
+    }
 
     [image unlockFocus];
     image.template = YES;
@@ -274,6 +321,10 @@ static NSString * const HTTPUserAgent = @"claude-cli/0.1.0 (external, menu-bar)"
                       action:@selector(useCountdownTime)
                      checked:[[self timeMode] isEqualToString:TimeModeCountdown]
                       toMenu:menu];
+    [self addChoiceWithTitle:@"Hide Time"
+                      action:@selector(useHiddenTime)
+                     checked:[[self timeMode] isEqualToString:TimeModeHidden]
+                      toMenu:menu];
 
     [menu addItem:[NSMenuItem separatorItem]];
     [self addRefreshIntervalSubmenuToMenu:menu];
@@ -346,22 +397,36 @@ static NSString * const HTTPUserAgent = @"claude-cli/0.1.0 (external, menu-bar)"
 - (void)updateStatusItem {
     NSDictionary *state = self.latestState;
     NSNumber *ok = state[@"ok"];
+    self.statusItem.button.imagePosition = NSImageLeft;
     if (![ok respondsToSelector:@selector(boolValue)] || ![ok boolValue]) {
+        // Even with the time hidden, errors keep their "--" so they stay visible.
         self.statusItem.button.image = self.claudeIcon;
         self.statusItem.button.title = @"--";
         return;
     }
 
     double metric = [self displayPercentForWidgetState:state];
-    NSString *timeText = [self timeTextForWidgetState:state];
+    BOOL hideTime = [[self timeMode] isEqualToString:TimeModeHidden];
+    NSString *timeText = hideTime ? @"" : [self timeTextForWidgetState:state];
     BOOL stale = [self displayIsStale];
 
     if ([[self displayMode] isEqualToString:DisplayModeBattery]) {
         // Never draw a stale snapshot as a battery level: an hours-old "0% used"
         // renders as a full charge, which reads as good news rather than as no
         // news. Fall back to the plain icon plus a stale marker.
-        self.statusItem.button.image = stale ? self.claudeIcon : [self batteryIconForPercent:metric];
-        self.statusItem.button.title = stale ? [self staleMarkedTitle:timeText] : timeText;
+        if (stale) {
+            self.statusItem.button.image = self.claudeIcon;
+            self.statusItem.button.title = [self staleMarkedTitle:timeText];
+            return;
+        }
+        // The marker is measured in quota left, so it only means something in % Left.
+        double onPace = [[self metricMode] isEqualToString:MetricModeLeft]
+            ? [self onPacePercentForWidgetState:state]
+            : NAN;
+        self.statusItem.button.image = [self batteryIconForPercent:metric onPacePercent:onPace];
+        // With the time hidden the battery already carries the percentage, so show the image alone.
+        self.statusItem.button.imagePosition = hideTime ? NSImageOnly : NSImageLeft;
+        self.statusItem.button.title = timeText;
         return;
     }
 
@@ -371,13 +436,32 @@ static NSString * const HTTPUserAgent = @"claude-cli/0.1.0 (external, menu-bar)"
         title = timeText.length > 0 ? timeText : @"--";
     } else {
         NSString *metricLabel = [self metricLabel];
-        if (metricLabel.length > 0) {
-            title = [NSString stringWithFormat:@"%@ | %.0f%% %@", timeText, metric, metricLabel];
-        } else {
-            title = [NSString stringWithFormat:@"%@ | %.0f%%", timeText, metric];
-        }
+        NSString *percentText = metricLabel.length > 0
+            ? [NSString stringWithFormat:@"%.0f%% %@", metric, metricLabel]
+            : [NSString stringWithFormat:@"%.0f%%", metric];
+        title = hideTime ? percentText : [NSString stringWithFormat:@"%@ | %@", timeText, percentText];
     }
     self.statusItem.button.title = stale ? [self staleMarkedTitle:title] : title;
+}
+
+// Quota that would be left if usage were spread evenly across the window:
+// (time until reset / window length) × 100. If the battery fill ends right of
+// the marker, you are under pace. NAN when there is no active window.
+- (double)onPacePercentForWidgetState:(NSDictionary *)state {
+    // Match the window the battery is actually showing: weekly mode falls back
+    // to session numbers when the response has no weekly usage.
+    BOOL weekly = [[self widgetWindowMode] isEqualToString:WidgetWindowWeekly] &&
+                  [state[@"secondary_used_percent"] respondsToSelector:@selector(doubleValue)];
+    id reset = weekly ? state[@"secondary_resets_at"] : state[@"primary_resets_at"];
+    if (![reset respondsToSelector:@selector(doubleValue)]) {
+        return NAN;
+    }
+    double remaining = [reset doubleValue] - [NSDate date].timeIntervalSince1970;
+    if (remaining <= 0.0) {
+        return NAN;
+    }
+    NSTimeInterval duration = weekly ? WeeklyWindowSeconds : SessionWindowSeconds;
+    return MAX(0.0, MIN(100.0, (remaining / duration) * 100.0));
 }
 
 // Stale for a few minutes is just a missed poll; stale for longer means the
@@ -591,6 +675,12 @@ static NSString * const HTTPUserAgent = @"claude-cli/0.1.0 (external, menu-bar)"
 
 - (void)useCountdownTime {
     [NSUserDefaults.standardUserDefaults setObject:TimeModeCountdown forKey:TimeModeKey];
+    [self updateStatusItem];
+    self.statusItem.menu = [self menuForCurrentState];
+}
+
+- (void)useHiddenTime {
+    [NSUserDefaults.standardUserDefaults setObject:TimeModeHidden forKey:TimeModeKey];
     [self updateStatusItem];
     self.statusItem.menu = [self menuForCurrentState];
 }
