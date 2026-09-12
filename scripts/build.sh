@@ -22,7 +22,6 @@ env CLANG_MODULE_CACHE_PATH="$ROOT_DIR/.build/module-cache" \
   -fobjc-arc \
   -framework Cocoa \
   -framework ServiceManagement \
-  -framework Security \
   -O2 \
   -o "$BINARY"
 
@@ -69,16 +68,16 @@ PLIST
 
 xattr -cr "$APP_DIR" 2>/dev/null || true
 find "$APP_DIR" -name '.DS_Store' -delete 2>/dev/null || true
-# Sign with a real identity when one exists. An ad-hoc signature ("-") has no
-# Team ID, and macOS won't durably attach a keychain "Always Allow" grant to it —
-# so every run re-prompts for the password no matter how many times you allow it.
-# Prefer $CODESIGN_IDENTITY, else the first available code-signing identity.
+# Sign with a real identity when one exists, else ad-hoc. Keychain access does not
+# depend on this: the app goes through /usr/bin/security, which the credentials
+# item already trusts. Prefer $CODESIGN_IDENTITY, else the first available
+# code-signing identity.
 if [ -z "${CODESIGN_IDENTITY:-}" ]; then
   CODESIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
     | sed -n 's/^ *1) [0-9A-F]* "\(.*\)"$/\1/p' | head -1)"
 fi
 if [ -z "$CODESIGN_IDENTITY" ]; then
-  echo "warning: no code-signing identity found; falling back to ad-hoc (expect repeated keychain prompts)" >&2
+  echo "note: no code-signing identity found; signing ad-hoc" >&2
   CODESIGN_IDENTITY="-"
 fi
 codesign --force --deep --sign "$CODESIGN_IDENTITY" --options runtime "$APP_DIR" >/dev/null
