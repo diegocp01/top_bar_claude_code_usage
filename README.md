@@ -35,6 +35,7 @@ Click the menu-bar item to choose:
   countdown and reset time stay in the dropdown.
 - Refresh interval: 30 seconds, 1 minute, 3 minutes, or 5 minutes.
 - Launch at Login, backed by `SMAppService`.
+- **Check for Updates…** — see [Updating](#updating).
 
 ### On-pace marker
 
@@ -85,6 +86,23 @@ happened to you, click **Always Allow** once on the next prompt that names
 
 ```sh
 security set-generic-password-partition-list -s "Claude Code-credentials" -S apple-tool:
+```
+
+## Updating
+
+Choose **Check for Updates…** in the menu. The build script records the commit
+each build came from, and the app compares it with `main` on GitHub:
+
+- Nothing new → **No updates**.
+- Something new → **Update?**, listing the merged PRs. **Yes** runs
+  `git pull --ff-only` in the checkout the app was built from, rebuilds it with
+  `./scripts/build.sh`, and restarts the app.
+
+The checkout must be on `main`; otherwise the app says so and changes nothing.
+To check from a terminal:
+
+```sh
+".build/release/Claude Code Usage Menu Bar.app/Contents/MacOS/ClaudeCodeUsageMenuBar" --check-updates
 ```
 
 ## Launch at Login
