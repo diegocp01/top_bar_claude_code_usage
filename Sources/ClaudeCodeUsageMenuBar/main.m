@@ -42,6 +42,7 @@ static NSString * const LastErrorAtKey = @"lastErrorAt";
 static NSTimeInterval const UsageBackoffMaxSeconds = 600.0;
 
 // Claude Code OAuth configuration (matches the Claude Code CLI production config).
+static NSString * const GitHubRepo = @"diegocp01/top_bar_claude_code_usage";
 static NSString * const KeychainService = @"Claude Code-credentials";
 // All keychain access goes through /usr/bin/security, exactly as Claude Code
 // does. The item's access list trusts that tool (partition "apple-tool:"), so
@@ -82,6 +83,8 @@ static NSString * const HTTPUserAgent = @"claude-cli/0.1.0 (external, menu-bar)"
 @property(nonatomic, strong) NSDate *lastGoodFetchedAt;
 @property(nonatomic, strong) NSDate *usageBackoffUntil;
 @property(nonatomic, assign) NSTimeInterval usageBackoffSeconds;
+// What Check for Updates is doing right now ("Checking…", "Updating…"), or nil.
+@property(nonatomic, copy) NSString *updateActivity;
 @end
 
 @implementation AppDelegate
@@ -347,6 +350,13 @@ static NSString * const HTTPUserAgent = @"claude-cli/0.1.0 (external, menu-bar)"
                                               keyEquivalent:@"r"];
     refresh.target = self;
     [menu addItem:refresh];
+
+    // No action while busy: the menu auto-enables items, so that greys it out.
+    NSMenuItem *updates = [[NSMenuItem alloc] initWithTitle:self.updateActivity ?: @"Check for Updates…"
+                                                     action:self.updateActivity ? nil : @selector(checkForUpdates)
+                                              keyEquivalent:@""];
+    updates.target = self;
+    [menu addItem:updates];
 
     NSMenuItem *quit = [[NSMenuItem alloc] initWithTitle:@"Quit"
                                                   action:@selector(quit)
@@ -1514,16 +1524,259 @@ static NSString * const HTTPUserAgent = @"claude-cli/0.1.0 (external, menu-bar)"
     [NSApp terminate:nil];
 }
 
+#pragma mark - Updates
+
+// Where this build came from; scripts/build.sh writes both into Info.plist.
+- (NSString *)bundledGitCommit {
+    NSString *sha = NSBundle.mainBundle.infoDictionary[@"ClaudeUsageGitCommit"];
+    return [sha isKindOfClass:[NSString class]] ? sha : @"";
+}
+
+- (NSString *)bundledSourceRepo {
+    NSString *path = NSBundle.mainBundle.infoDictionary[@"ClaudeUsageSourceRepo"];
+    return [path isKindOfClass:[NSString class]] ? path : @"";
+}
+
+// Compares the commit this build came from with GitHub main. Returns ok,
+// updateAvailable, aheadBy, remoteSHA and changes (merged PR titles, or commit
+// subjects when nothing came in through a PR) — or ok = NO with an error.
+- (NSDictionary *)checkForUpdateSinceCommit:(NSString *)sha {
+    if (sha.length < 7) {
+        return @{@"ok": @NO, @"error": @"This build has no commit info. Rebuild it with ./scripts/build.sh."};
+    }
+    NSString *url = [NSString stringWithFormat:@"https://api.github.com/repos/%@/compare/%@...main", GitHubRepo, sha];
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]];
+    request.timeoutInterval = 15.0;
+    [request setValue:@"application/vnd.github+json" forHTTPHeaderField:@"Accept"];
+    [request setValue:@"ClaudeCodeUsageMenuBar" forHTTPHeaderField:@"User-Agent"];
+
+    NSInteger status = 0;
+    NSString *httpError = nil;
+    NSData *data = [self sendRequest:request statusCode:&status retryAfter:NULL error:&httpError];
+    if (status == 404) {
+        return @{@"ok": @NO, @"error": [NSString stringWithFormat:
+            @"This build's commit (%@) isn't on GitHub. Push it, or rebuild from main.", [sha substringToIndex:7]]};
+    }
+    id json = data != nil ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+    if (status != 200 || ![json isKindOfClass:[NSDictionary class]]) {
+        return @{@"ok": @NO, @"error": httpError ?: [NSString stringWithFormat:@"GitHub HTTP %ld", (long)status]};
+    }
+
+    NSArray *commits = [json[@"commits"] isKindOfClass:[NSArray class]] ? json[@"commits"] : @[];
+    NSMutableArray<NSString *> *pullRequests = [NSMutableArray array];
+    NSMutableArray<NSString *> *subjects = [NSMutableArray array];
+    for (NSDictionary *commit in commits) {
+        if (![commit isKindOfClass:[NSDictionary class]]) {
+            continue;
+        }
+        NSString *message = [commit[@"commit"] isKindOfClass:[NSDictionary class]] ? commit[@"commit"][@"message"] : nil;
+        if (![message isKindOfClass:[NSString class]]) {
+            continue;
+        }
+        NSMutableArray<NSString *> *lines = [NSMutableArray array];
+        for (NSString *line in [message componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
+            NSString *trimmed = [line stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+            if (trimmed.length > 0) {
+                [lines addObject:trimmed];
+            }
+        }
+        if (lines.count == 0) {
+            continue;
+        }
+        // GitHub merge commits read "Merge pull request #N from …", then the PR title.
+        NSInteger number = 0;
+        NSScanner *scanner = [NSScanner scannerWithString:lines[0]];
+        if ([scanner scanString:@"Merge pull request #" intoString:NULL] && [scanner scanInteger:&number]) {
+            [pullRequests addObject:lines.count > 1
+                ? [NSString stringWithFormat:@"#%ld %@", (long)number, lines[1]]
+                : [NSString stringWithFormat:@"PR #%ld", (long)number]];
+        } else {
+            [subjects addObject:lines[0]];
+        }
+    }
+
+    // "behind" means this build is newer than main (e.g. a branch build): nothing to pull.
+    NSInteger aheadBy = MAX(0, [json[@"ahead_by"] integerValue]);
+    NSDictionary *tip = commits.lastObject;
+    NSString *remoteSHA = [tip isKindOfClass:[NSDictionary class]] && [tip[@"sha"] isKindOfClass:[NSString class]] ? tip[@"sha"] : sha;
+    return @{
+        @"ok": @YES,
+        @"updateAvailable": @(aheadBy > 0),
+        @"aheadBy": @(aheadBy),
+        @"currentSHA": sha,
+        @"remoteSHA": remoteSHA,
+        @"changes": pullRequests.count > 0 ? pullRequests : subjects
+    };
+}
+
+// Runs a command to completion; stdout and stderr come back together.
+- (int)runCommand:(NSString *)path arguments:(NSArray<NSString *> *)arguments directory:(NSString *)directory output:(NSString **)output {
+    NSTask *task = [[NSTask alloc] init];
+    task.executableURL = [NSURL fileURLWithPath:path];
+    task.arguments = arguments;
+    task.currentDirectoryURL = [NSURL fileURLWithPath:directory];
+    NSMutableDictionary *environment = [NSProcessInfo.processInfo.environment mutableCopy];
+    // Apps started from Finder get a minimal PATH; the build needs clang, codesign, etc.
+    environment[@"PATH"] = @"/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin";
+    environment[@"GIT_TERMINAL_PROMPT"] = @"0";
+    task.environment = environment;
+    NSPipe *pipe = [NSPipe pipe];
+    task.standardOutput = pipe;
+    task.standardError = pipe;
+    task.standardInput = [NSFileHandle fileHandleWithNullDevice];
+    if (![task launchAndReturnError:NULL]) {
+        if (output) {
+            *output = [NSString stringWithFormat:@"Could not run %@", path.lastPathComponent];
+        }
+        return -1;
+    }
+    // Drain before waiting so a chatty build can't fill the pipe and stall.
+    NSData *data = [pipe.fileHandleForReading readDataToEndOfFile];
+    [task waitUntilExit];
+    if (output) {
+        NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"";
+        *output = [text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    }
+    return task.terminationStatus;
+}
+
+// Fast-forwards the checkout this build came from and rebuilds the app in place.
+// Returns nil and the rebuilt .app path on success, else a message for the user.
+- (NSString *)pullAndRebuildRepo:(NSString *)repo appPath:(NSString **)appPath {
+    BOOL isDirectory = NO;
+    if (repo.length == 0 ||
+        ![NSFileManager.defaultManager fileExistsAtPath:[repo stringByAppendingPathComponent:@".git"] isDirectory:&isDirectory]) {
+        return @"Can't find the git checkout this app was built from. Update by hand:\ngit pull && ./scripts/build.sh";
+    }
+
+    NSString *output = nil;
+    if ([self runCommand:@"/usr/bin/git" arguments:@[@"rev-parse", @"--abbrev-ref", @"HEAD"] directory:repo output:&output] != 0) {
+        return output;
+    }
+    if (![output isEqualToString:@"main"]) {
+        return [NSString stringWithFormat:@"The checkout at %@ is on branch \"%@\". Switch it to main to update.", repo, output];
+    }
+    if ([self runCommand:@"/usr/bin/git" arguments:@[@"pull", @"--ff-only", @"origin", @"main"] directory:repo output:&output] != 0) {
+        return [NSString stringWithFormat:@"git pull failed:\n%@", output];
+    }
+    if ([self runCommand:@"/bin/bash" arguments:@[@"scripts/build.sh"] directory:repo output:&output] != 0) {
+        NSString *tail = output.length > 800 ? [output substringFromIndex:output.length - 800] : output;
+        return [NSString stringWithFormat:@"Build failed:\n%@", tail];
+    }
+    // build.sh prints the .app path as its last line.
+    NSString *built = [[output componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet] lastObject];
+    if (![built.pathExtension isEqualToString:@"app"] || ![NSFileManager.defaultManager fileExistsAtPath:built]) {
+        return @"The build finished, but the app wasn't where build.sh said it would be.";
+    }
+    if (appPath) {
+        *appPath = built;
+    }
+    return nil;
+}
+
+- (void)setUpdateActivityAndRefreshMenu:(NSString *)activity {
+    self.updateActivity = activity;
+    self.statusItem.menu = [self menuForCurrentState];
+}
+
+- (void)checkForUpdates {
+    if (self.updateActivity != nil) {
+        return;
+    }
+    [self setUpdateActivityAndRefreshMenu:@"Checking for Updates…"];
+    NSString *sha = [self bundledGitCommit];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSDictionary *result = [self checkForUpdateSinceCommit:sha];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self setUpdateActivityAndRefreshMenu:nil];
+            [self presentUpdateCheckResult:result];
+        });
+    });
+}
+
+- (void)presentUpdateCheckResult:(NSDictionary *)result {
+    [NSApp activateIgnoringOtherApps:YES];
+    NSAlert *alert = [[NSAlert alloc] init];
+    if (![result[@"ok"] boolValue]) {
+        alert.messageText = @"Couldn't check for updates";
+        alert.informativeText = result[@"error"] ?: @"GitHub could not be reached.";
+        [alert runModal];
+        return;
+    }
+    if (![result[@"updateAvailable"] boolValue]) {
+        NSString *sha = result[@"currentSHA"];
+        alert.messageText = @"No updates";
+        alert.informativeText = [NSString stringWithFormat:@"You're on the latest main (%@).", [sha substringToIndex:MIN((NSUInteger)7, sha.length)]];
+        [alert runModal];
+        return;
+    }
+
+    NSInteger aheadBy = [result[@"aheadBy"] integerValue];
+    NSArray<NSString *> *changes = result[@"changes"];
+    NSMutableArray<NSString *> *lines = [NSMutableArray array];
+    for (NSUInteger i = 0; i < MIN(changes.count, (NSUInteger)8); i++) {
+        [lines addObject:[@"• " stringByAppendingString:changes[i]]];
+    }
+    if (changes.count > 8) {
+        [lines addObject:[NSString stringWithFormat:@"• …and %lu more", (unsigned long)(changes.count - 8)]];
+    }
+    alert.messageText = @"Update?";
+    alert.informativeText = [NSString stringWithFormat:@"%@ on GitHub main:\n\n%@\n\nPull, rebuild, and restart now?",
+                             aheadBy == 1 ? @"1 new commit" : [NSString stringWithFormat:@"%ld new commits", (long)aheadBy],
+                             [lines componentsJoinedByString:@"\n"]];
+    [alert addButtonWithTitle:@"Yes"];
+    [alert addButtonWithTitle:@"No"];
+    if ([alert runModal] == NSAlertFirstButtonReturn) {
+        [self applyUpdate];
+    }
+}
+
+- (void)applyUpdate {
+    [self setUpdateActivityAndRefreshMenu:@"Updating…"];
+    NSString *repo = [self bundledSourceRepo];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSString *appPath = nil;
+        NSString *failure = [self pullAndRebuildRepo:repo appPath:&appPath];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self setUpdateActivityAndRefreshMenu:nil];
+            if (failure != nil) {
+                [NSApp activateIgnoringOtherApps:YES];
+                NSAlert *alert = [[NSAlert alloc] init];
+                alert.messageText = @"Update failed";
+                alert.informativeText = failure;
+                [alert runModal];
+                return;
+            }
+            // Start the new build, then get out of its way.
+            NSTask *open = [[NSTask alloc] init];
+            open.executableURL = [NSURL fileURLWithPath:@"/usr/bin/open"];
+            open.arguments = @[@"-g", @"-n", appPath];
+            [open launchAndReturnError:NULL];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                [NSApp terminate:nil];
+            });
+        });
+    });
+}
+
 @end
 
 int main(int argc, const char *argv[]) {
-    (void)argc;
-    (void)argv;
     // We feed /usr/bin/security over a pipe; if it ever exits before reading,
     // the write must fail with EPIPE rather than kill the app.
     signal(SIGPIPE, SIG_IGN);
 
     @autoreleasepool {
+        // Headless update check for scripts and testing: prints the result as JSON.
+        if (argc > 1 && strcmp(argv[1], "--check-updates") == 0) {
+            AppDelegate *delegate = [[AppDelegate alloc] init];
+            NSDictionary *result = [delegate checkForUpdateSinceCommit:[delegate bundledGitCommit]];
+            NSData *json = [NSJSONSerialization dataWithJSONObject:result options:NSJSONWritingPrettyPrinted error:NULL];
+            fwrite(json.bytes, 1, json.length, stdout);
+            fputc('\n', stdout);
+            return [result[@"ok"] boolValue] ? 0 : 1;
+        }
+
         NSApplication *app = [NSApplication sharedApplication];
         AppDelegate *delegate = [[AppDelegate alloc] init];
         app.delegate = delegate;

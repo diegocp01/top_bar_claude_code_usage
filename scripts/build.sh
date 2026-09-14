@@ -66,6 +66,11 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
 </plist>
 PLIST
 
+# Record where this build came from, for Check for Updates.
+GIT_COMMIT="$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || true)"
+plutil -insert ClaudeUsageGitCommit -string "$GIT_COMMIT" "$CONTENTS_DIR/Info.plist"
+plutil -insert ClaudeUsageSourceRepo -string "$ROOT_DIR" "$CONTENTS_DIR/Info.plist"
+
 xattr -cr "$APP_DIR" 2>/dev/null || true
 find "$APP_DIR" -name '.DS_Store' -delete 2>/dev/null || true
 # Sign with a real identity when one exists, else ad-hoc. Keychain access does not
